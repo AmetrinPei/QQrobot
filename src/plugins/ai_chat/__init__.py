@@ -1,12 +1,12 @@
 """硅基流动 AI 对话插件。
 
 - 密钥/模型：项目根目录 .env.dev
-- 人设与边界：项目根目录 persona.txt
-- 短期记忆 + 通讯录/亲疏：data/memory.db；/备注 /关系 /忘记短期 /记忆列表
+- 人设与边界：persona.txt（可用 QQBOT_PERSONA_FILE 切换，见 bot_niko.py）
+- 短期记忆 + 通讯录/亲疏：data/memory.db（可用 QQBOT_DATA_DIR 切换）；/备注 /关系 /忘记短期 /记忆列表
 - 长期记忆：/记住 /忘掉 /长期记忆
 - 拟人：时间感知、情绪状态、多段发送、群主动插话、可选私聊关心
-- 识图：有图时先走视觉模型描述，再交给文本模型按人设回答
-- 触发：群聊 @机器人；@ 后短时间内的跟进文字/表情（必要时才回）；
+- 识图：默认关闭；开启时有图先走视觉模型再交给文本模型；关闭时含图消息不回应
+- 触发：群聊 @机器人；@ 后短时间内的跟进文字（识图开启时也可跟进表情）；
   回复机器人消息；私聊直接发消息。多人同时聊时回复会带 @
 - 定时：每隔一段时间若群里有新消息，可主动轻轻接一句（插不上就沉默）
 """
@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-from pathlib import Path
 
 from nonebot import get_driver, get_plugin_config, logger, on_message
 from nonebot.adapters.onebot.v11 import (
@@ -36,10 +35,9 @@ from . import mood
 from . import proactive as pro
 from . import session as sess
 from . import time_context as tctx
+from . import vigilance as vig
 from . import vision as vis
-
-ROOT = Path(__file__).resolve().parents[3]
-PERSONA_FILE = ROOT / "persona.txt"
+from .paths import PERSONA_FILE
 
 ADMIN_CMD_PREFIXES = (
     "/记住",
@@ -68,10 +66,12 @@ FOLLOWUP_JUDGE_NOTE = (
 
 class Config(BaseModel):
     siliconflow_api_key: str = Field(default="")
-    siliconflow_base_url: str = Field(default="https://api.siliconflow.cn/v1")
-    siliconflow_model: str = Field(default="deepseek-ai/DeepSeek-V4-Pro")
-    siliconflow_vision_model: str = Field(
-        default="Qwen/Qwen3-VL-8B-Instruct"
+    siliconflow_base_url: str = Field(default="https://api.deepseek.com")
+    siliconflow_model: str = Field(default="deepseek-v4-flash")
+    siliconflow_vision_model: str = Field(default="")
+    vision_enabled: bool = Field(
+        default=False,
+        description="是否开启识图；关闭时含图片的消息不回应",
     )
     admin_qq: str = Field(
         default="",
@@ -191,6 +191,14 @@ client = AsyncOpenAI(
     base_url=config.siliconflow_base_url,
 )
 
+logger.info(
+    "模型客户端已初始化："
+    f"base_url={config.siliconflow_base_url} "
+    f"model={config.siliconflow_model} "
+    f"vision={config.vision_enabled} "
+    f"key=...{(config.siliconflow_api_key or '')[-4:]}"
+)
+
 
 def load_system_prompt() -> str:
     if PERSONA_FILE.is_file():
@@ -222,11 +230,15 @@ def raw_display_name(event: MessageEvent) -> str:
 
 
 def speaker_label(event: MessageEvent) -> str:
-    """优先用通讯录备注，否则群名片/昵称；附带亲疏。"""
+    """优先用通讯录备注，否则群名片/昵称；附带亲疏与警惕标识。"""
     alias = sess.get_alias(event.user_id)
     name = alias or raw_display_name(event)
     tier = sess.get_tier(event.user_id)
-    return f"{name}(QQ:{event.user_id}，{tier})"
+    label = f"{name}(QQ:{event.user_id}，{tier}"
+    if vig.is_alert(event.user_id):
+        label += "，警惕"
+    label += ")"
+    return label
 
 
 def build_system_prompt(
@@ -234,6 +246,7 @@ def build_system_prompt(
     scene: str,
     followup: bool = False,
     relation_tier: str | None = None,
+    user_id: int | str | None = None,
 ) -> str:
     """组装完整 system：人设 + 时间 + 情绪 + 关系 + 气泡提示。"""
     mood.apply_time_drift()
@@ -244,7 +257,13 @@ def build_system_prompt(
         bubble.BUBBLE_HINT,
         f"当前场景：{scene}。请按上述人设与边界回答。",
     ]
-    if relation_tier:
+    if user_id is not None and vig.is_alert(user_id):
+        note = vig.format_vigilance_for_prompt(user_id)
+        if note:
+            parts.append(note)
+        # 警惕期间不用亲密亲疏提示，改按陌生人克制
+        parts.append(sess.relation_prompt_note(vig.effective_relation_tier(user_id, "陌生人")))
+    elif relation_tier:
         parts.append(sess.relation_prompt_note(relation_tier))
     if followup:
         parts.append(FOLLOWUP_JUDGE_NOTE)
@@ -292,7 +311,7 @@ def message_at_others_only(event: GroupMessageEvent) -> bool:
 
 
 def is_group_followup(event: MessageEvent) -> bool:
-    """近期互动过、未再 @ 机器人的跟进消息（文字或图）。"""
+    """近期互动过、未再 @ 机器人的跟进消息（文字；识图开启时也可跟进图）。"""
     if not isinstance(event, GroupMessageEvent):
         return False
     if event.is_tome() or is_reply_to_me(event):
@@ -307,6 +326,9 @@ def is_group_followup(event: MessageEvent) -> bool:
         return False
     text = (event.get_plaintext() or "").strip()
     has_img = vis.message_has_image(event)
+    # 关闭识图：含图消息不当跟进（主流程也会静默不回）
+    if has_img and not config.vision_enabled:
+        return False
     if not text and not has_img:
         return False
     return True
@@ -648,7 +670,13 @@ async def handle_admin_memory_cmd(
         content = text[len("/记住") :].strip()
         if not content:
             return "用法：/记住 内容"
-        mem.add_fact(content, scope="global", source="manual")
+        banned = mem.is_forbidden_fact(content)
+        if banned:
+            return f"拒绝记住：{banned}"
+        try:
+            mem.add_fact(content, scope="global", source="manual")
+        except ValueError as e:
+            return f"拒绝记住：{e}"
         return f"记住了：{content}"
 
     if text.startswith("/忘掉"):
@@ -673,12 +701,21 @@ async def handle_chat(bot: Bot, event: MessageEvent):
     text = _strip_at_text(event, event.get_plaintext())
     image_urls = vis.extract_image_urls(event)
     followup = is_group_followup(event)
-    followup_image = followup and vis.is_image_followup_candidate(event)
+    followup_image = (
+        config.vision_enabled
+        and followup
+        and vis.is_image_followup_candidate(event)
+    )
 
     if isinstance(event, PrivateMessageEvent) and text.startswith("/"):
         cmd_reply = await handle_admin_memory_cmd(bot, event, text)
         if cmd_reply is not None:
             await chat.finish(cmd_reply)
+
+    # 关闭识图：含图片的消息一律静默不回
+    if image_urls and not config.vision_enabled:
+        logger.info(f"识图已关闭，忽略图片消息 user={event.user_id}")
+        await chat.finish()
 
     if not text and not image_urls:
         if followup:
@@ -697,9 +734,9 @@ async def handle_chat(bot: Bot, event: MessageEvent):
         is_private=isinstance(event, PrivateMessageEvent),
     )
 
-    # ----- 识图 -----
+    # ----- 识图（仅 vision_enabled 时）-----
     image_description = ""
-    if image_urls:
+    if image_urls and config.vision_enabled:
         image_description = await vis.describe_images(
             client,
             model=config.siliconflow_vision_model,
@@ -723,6 +760,22 @@ async def handle_chat(bot: Bot, event: MessageEvent):
     else:
         user_content = vis.build_user_content_with_vision(text, image_description)
 
+    # 攻击意图 → 仅标记该用户；首回后重复话题静默，直到解除
+    vigil_text = text or ""
+    if image_description:
+        vigil_text = f"{vigil_text}\n{image_description}".strip()
+    was_alert = vig.is_alert(event.user_id)
+    still_alert = vig.update_on_message(event.user_id, vigil_text)
+    if still_alert and not was_alert:
+        logger.info(f"进入警惕 user={event.user_id} text={vigil_text[:40]!r}")
+    elif was_alert and not still_alert:
+        logger.info(f"解除警惕 user={event.user_id}")
+
+    # 已对该攻击者回应过：同一攻击话题/其人后续消息静默，直到攻击性解除
+    if vig.should_ignore_message(event.user_id, vigil_text):
+        logger.info(f"警惕静默忽略 user={event.user_id}")
+        await chat.finish()
+
     if followup:
         if followup_image:
             user_content = (
@@ -735,6 +788,7 @@ async def handle_chat(bot: Bot, event: MessageEvent):
 
     speaker = speaker_label(event)
     relation_tier = sess.get_tier(event.user_id)
+    prompt_tier = vig.effective_relation_tier(event.user_id, relation_tier)
     user_content_for_model = f"说话人：{speaker}\n{user_content}"
 
     sk = current_session_key(event)
@@ -744,7 +798,8 @@ async def handle_chat(bot: Bot, event: MessageEvent):
     full_system = build_system_prompt(
         scene=scene,
         followup=followup,
-        relation_tier=relation_tier,
+        relation_tier=prompt_tier,
+        user_id=event.user_id,
     )
     if config.memory_long_term_enabled:
         facts = mem.retrieve_facts(
@@ -781,6 +836,14 @@ async def handle_chat(bot: Bot, event: MessageEvent):
         logger.info(f"跟进消息判定无需回复 user={event.user_id}")
         await chat.finish()
 
+    # 强制去掉括号动作 / 困倦口头禅（分段发送前还会再润色短句句号）
+    reply = bubble.strip_stage_directions(reply)
+    reply = bubble.strip_sleepy_talk(reply)
+    if not reply:
+        if followup:
+            await chat.finish()
+        await chat.finish("……")
+
     if len(reply) > 1500:
         reply = reply[:1500] + "…"
 
@@ -811,6 +874,10 @@ async def handle_chat(bot: Bot, event: MessageEvent):
         else:
             await chat.send(merged)
 
+    # 对该攻击者已回应一次：后续重复攻击话题静默，直到解除
+    if vig.is_alert(event.user_id):
+        vig.mark_replied(event.user_id)
+
     try:
         sess.append_turn(
             sk,
@@ -826,7 +893,7 @@ async def handle_chat(bot: Bot, event: MessageEvent):
             user_text=text or user_content,
             assistant_text=merged,
             is_private=isinstance(event, PrivateMessageEvent),
-            relation_tier=relation_tier,
+            relation_tier=prompt_tier,
         )
     except Exception as e:
         logger.warning(f"更新心情失败：{e}")
@@ -838,7 +905,10 @@ async def handle_chat(bot: Bot, event: MessageEvent):
     should_extract = config.memory_long_term_enabled and (
         isinstance(event, PrivateMessageEvent) or config.memory_long_term_group
     )
-    if should_extract and (text or image_description):
+    skip_mem = vig.should_skip_long_term_memory(event.user_id, vigil_text)
+    if skip_mem:
+        logger.info(f"警惕中跳过长期记忆抽取 user={event.user_id}")
+    elif should_extract and (text or image_description):
         extract_text = text or "[图片]"
         if image_description:
             extract_text = f"{extract_text}\n[图片描述]{image_description}"

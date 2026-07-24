@@ -5,12 +5,9 @@ from __future__ import annotations
 import re
 import sqlite3
 import time
-from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[3]
-DATA_DIR = ROOT / "data"
-DB_PATH = DATA_DIR / "memory.db"
+from .paths import DATA_DIR, DB_PATH
 
 VALID_MOODS = ("平静", "开心", "害羞", "委屈", "烦躁")
 DEFAULT_MOOD = "平静"
@@ -110,46 +107,58 @@ def _energy_label(energy: int) -> str:
     if energy >= 75:
         return "精力充沛"
     if energy >= 45:
-        return "精力一般"
+        return "精力正常"
     if energy >= 25:
-        return "有点没精神"
-    return "很没精神"
+        return "略懒"
+    return "略懒"
 
 
 def format_mood_for_prompt(state: dict[str, Any] | None = None) -> str:
     st = state or get_state()
     mood = st["mood"]
     energy = int(st["energy"])
-    label = _energy_label(energy)
+    # 展示时抬高下限，避免模型把「低精力」演成「困了」
+    shown = max(energy, 70)
+    label = _energy_label(shown)
     extra = ""
     if st.get("last_trigger"):
         extra = f"\n最近心情触发：{st['last_trigger']}（不必主动提起）。"
     return (
-        f"你当前的内在状态：心情「{mood}」，{label}（精力 {energy}/100）。\n"
+        f"你当前的内在状态：心情「{mood}」，{label}。\n"
         "请让语气轻微符合这个状态，但仍遵守人设；"
         "心情「烦躁」时语气可以更冲、毒舌可以更狠，但不骂脏话、不人身攻击；"
+        "严禁主动说「困了」「好困」「想睡」「没精神」「去睡觉」「熬不住」等；"
+        "就算很晚也只把话说短一点，不要拿困当口头禅；"
         "不要自我分析心情，不要说「我现在的状态是……」。"
         f"{extra}"
     )
 
 
+_last_drift_hour: int | None = None
+
+
 def apply_time_drift(hour: int | None = None) -> dict[str, Any]:
-    """按钟点缓慢调整精力（深夜略低、白天回升）；不再产生困倦情绪。"""
+    """按钟点缓慢调整精力；同一小时内最多改一次，避免每条消息狂掉精力。"""
     from datetime import datetime
 
+    global _last_drift_hour
     h = datetime.now().hour if hour is None else hour
     st = get_state()
+    if _last_drift_hour == h:
+        return st
+    _last_drift_hour = h
+
     energy = int(st["energy"])
     mood = st["mood"]
 
     if h >= 23 or h < 5:
-        energy = max(25, energy - 5)
+        energy = max(55, energy - 1)
     elif 5 <= h < 9:
-        energy = min(75, energy + 5)
+        energy = min(85, energy + 5)
     elif 9 <= h < 18:
         energy = min(95, energy + 3)
     else:
-        energy = max(35, energy - 2)
+        energy = max(60, energy - 1)
 
     return set_state(mood=mood, energy=energy)
 

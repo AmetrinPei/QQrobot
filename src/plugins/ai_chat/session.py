@@ -5,13 +5,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from pathlib import Path
 from typing import Any
 
 # 与 memory.py 共用同一库文件
-ROOT = Path(__file__).resolve().parents[3]
-DATA_DIR = ROOT / "data"
-DB_PATH = DATA_DIR / "memory.db"
+from .paths import DATA_DIR, DB_PATH
 
 # 亲疏等级（由疏到亲）
 TIER_STRANGER = "陌生人"
@@ -439,12 +436,12 @@ def relation_prompt_note(tier: str) -> str:
     t = normalize_tier(tier)
     if t == TIER_FAMILY:
         return (
-            "对方是家人级亲近的人：语气可以更软、更自然亲近，"
-            "愿意多接一句，但仍保持短句，不肉麻。"
+            "对方是家人级亲近的人：可以自然亲近一点、多接一句，"
+            "语气礼貌温和，不傲娇、不卖萌、不写括号动作。"
         )
     if t == TIER_FRIEND:
         return (
-            "对方是朋友：比陌生人更愿意接话，语气自然友好，仍不抢戏。"
+            "对方是朋友：比陌生人更愿意接话，礼貌友好，仍不抢戏、不显摆。"
         )
     if t == TIER_ACQUAINTANCE:
         return "对方是熟人：正常简短回应即可，不必过分客气。"

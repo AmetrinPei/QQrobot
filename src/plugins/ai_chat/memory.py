@@ -6,23 +6,47 @@ import json
 import re
 import sqlite3
 import time
-from pathlib import Path
 from typing import Any
 
 from nonebot import logger
 from openai import AsyncOpenAI
 
-ROOT = Path(__file__).resolve().parents[3]
-DATA_DIR = ROOT / "data"
-DB_PATH = DATA_DIR / "memory.db"
+from .paths import DATA_DIR, DB_PATH
 
 EXTRACT_SYSTEM = """你是记忆抽取助手。根据一轮对话，判断是否有「值得长期记住」的事实。
 规则：
 1. 只输出 JSON 数组，每项是一句简短中文事实；没有则输出 []
-2. 最多 3 条；只记与说话人相关、或对方明确要求记住的内容
-3. 不记：密码、验证码、隐私八卦、一时情绪、无意义闲聊
-4. 不要复述人设；不要编造对话里没有的信息
-示例输出：["皮皮塔米米喜欢猫","阿强下周有考试"]"""
+2. 最多 3 条；只记与「说话人」相关、或对方明确要求记住的内容
+3. 事实必须写清主体姓名/称呼（如「闪闪姐姐…」「小泥哥哥…」），禁止写「用户」「对方」这种无主体句
+4. 只记用户侧信息；禁止把助手自己的口头禅、推荐、观点、自称写成用户的事实
+5. 不记：密码、验证码、隐私八卦、一时情绪、无意义闲聊、玩笑挑拨、群吹水
+6. 不记已在人设里的设定；不编造对话里没有的信息
+7. 称呼纠正（如「我是姐姐不是哥哥」）优先记准；正常亲友称呼（哥哥/姐姐/昵称）可以记
+8. 【硬性禁止】不记任何占便宜、调戏、下流意味的称呼要求，例如：叫爸爸/叫爹/daddy、欧豆桑/欧多桑/欧吉桑、叫老公/叫老婆、叫主人/奴隶等。这类一律输出 [] 或跳过该条
+9. 【硬性禁止】对话含辱骂、威胁、挑拨身份、性骚扰等攻击意图时，整轮不要抽取任何事实，输出 []
+示例输出：["闪闪姐姐不喜欢被骂","小泥哥哥希望被叫做泥哥"]"""
+
+
+# 占便宜 / 下流称呼：抽取与手动 /记住 一律拦截
+_FORBIDDEN_ALIAS_RE = re.compile(
+    r"(欧豆桑|欧多桑|欧吉桑|ojisan|"
+    r"daddy|papa|"
+    r"(叫|喊|称呼).{0,10}(爸|爹|daddy|papa)|"
+    r"希望被叫.{0,10}(爸|爹|daddy|papa)|"
+    r"(叫|喊|称呼).{0,8}(老公|老婆|主人|奴隶)|"
+    r"做我的狗|好爸爸|干爸爸)",
+    re.IGNORECASE,
+)
+
+
+def is_forbidden_fact(content: str) -> str | None:
+    """若内容属于禁止入库的占便宜/下流称呼类记忆，返回原因；否则 None。"""
+    text = (content or "").strip()
+    if not text:
+        return "内容为空"
+    if _FORBIDDEN_ALIAS_RE.search(text):
+        return "禁止记住占便宜或下流意味的称呼（如叫爸爸、欧豆桑等）"
+    return None
 
 
 def _connect() -> sqlite3.Connection:
@@ -52,6 +76,9 @@ def add_fact(content: str, *, scope: str = "global", source: str = "manual") -> 
     content = content.strip()
     if not content:
         raise ValueError("内容为空")
+    reason = is_forbidden_fact(content)
+    if reason:
+        raise ValueError(reason)
     now = time.time()
     with _connect() as conn:
         cur = conn.execute(
@@ -264,6 +291,10 @@ async def extract_and_store(
 
     stored: list[str] = []
     for fact in facts:
+        banned = is_forbidden_fact(fact)
+        if banned:
+            logger.info(f"跳过禁止类长期记忆：{fact}（{banned}）")
+            continue
         try:
             add_fact(fact, scope=scope, source="auto")
             stored.append(fact)
