@@ -165,61 +165,112 @@ def _tokenize(text: str) -> set[str]:
     return set(parts)
 
 
-def retrieve_facts(query: str, *, limit: int = 8, max_total: int = 100) -> list[str]:
-    """按关键词重叠检索相关事实；无命中时返回最近若干条。"""
+def list_admin_facts(*, limit: int = 50) -> list[dict[str, Any]]:
     with _connect() as conn:
         rows = conn.execute(
             """
+            SELECT id, content, scope, source, created_at
+            FROM long_term_facts
+            WHERE source = 'admin'
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def retrieve_facts(query: str, *, limit: int = 8, max_total: int = 100) -> list[str]:
+    """检索长期事实；管理员写入（source=admin）始终优先置顶。"""
+    with _connect() as conn:
+        admin_rows = conn.execute(
+            """
             SELECT content FROM long_term_facts
+            WHERE source = 'admin'
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max(limit, 20),),
+        ).fetchall()
+        rows = conn.execute(
+            """
+            SELECT content, source FROM long_term_facts
             ORDER BY id DESC
             LIMIT ?
             """,
             (max_total,),
         ).fetchall()
-    if not rows:
+
+    admin_facts: list[str] = []
+    seen: set[str] = set()
+    for r in admin_rows:
+        c = str(r["content"]).strip()
+        if c and c not in seen:
+            seen.add(c)
+            admin_facts.append(c)
+
+    if not rows and not admin_facts:
         return []
 
     q_tokens = _tokenize(query)
     scored: list[tuple[int, str]] = []
     for row in rows:
-        content = str(row["content"])
+        content = str(row["content"]).strip()
+        if not content or content in seen:
+            continue
+        if str(row["source"] or "") == "admin":
+            continue  # 已在 admin_facts
         if not q_tokens:
             scored.append((0, content))
             continue
         c_tokens = _tokenize(content)
         overlap = len(q_tokens & c_tokens)
-        # 子串命中加分
         bonus = sum(1 for t in q_tokens if t in content.lower())
         score = overlap * 2 + bonus
         if score > 0:
             scored.append((score, content))
 
+    other: list[str] = []
     if scored:
         scored.sort(key=lambda x: (-x[0],))
-        seen: set[str] = set()
-        out: list[str] = []
         for _, content in scored:
             if content in seen:
                 continue
             seen.add(content)
-            out.append(content)
-            if len(out) >= limit:
+            other.append(content)
+            if len(admin_facts) + len(other) >= limit:
                 break
-        return out
+    elif not admin_facts:
+        for r in rows[: min(3, limit)]:
+            c = str(r["content"]).strip()
+            if c and c not in seen:
+                other.append(c)
 
-    # 无关键词命中：给一点近期记忆作旁路
-    return [str(r["content"]) for r in rows[: min(3, limit)]]
+    # 管理员记忆优先，其余按相关度补齐
+    room = max(0, limit - len(admin_facts))
+    return admin_facts + other[:room]
 
 
 def format_facts_for_prompt(facts: list[str]) -> str:
     if not facts:
         return ""
-    lines = "\n".join(f"- {f}" for f in facts)
-    return (
-        "以下是你已记住的长期事实（仅作参考，不要主动炫耀记忆，"
-        "也不要编造未列出的内容）：\n"
-        f"{lines}"
-    )
+    # 再查一遍哪些是 admin，便于标注优先
+    admin_set = {str(r["content"]) for r in list_admin_facts(limit=200)}
+    admin_lines = [f for f in facts if f in admin_set]
+    other_lines = [f for f in facts if f not in admin_set]
+    parts: list[str] = []
+    if admin_lines:
+        body = "\n".join(f"- {f}" for f in admin_lines)
+        parts.append(
+            "【管理员长期记忆·优先采信】与下方冲突时以本段为准：\n" + body
+        )
+    if other_lines:
+        body = "\n".join(f"- {f}" for f in other_lines)
+        parts.append(
+            "以下是其他已记住的长期事实（仅作参考，不要主动炫耀记忆，"
+            "也不要编造未列出的内容）：\n" + body
+        )
+    return "\n\n".join(parts)
 
 
 def _parse_facts_json(raw: str) -> list[str]:

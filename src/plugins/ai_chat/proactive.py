@@ -12,6 +12,7 @@ from nonebot import get_bots, logger
 from nonebot.adapters.onebot.v11 import Bot
 from openai import AsyncOpenAI
 
+from . import bot_control as botctl
 from . import bubble
 from . import mood
 from . import session as sess
@@ -130,6 +131,8 @@ async def run_proactive_tick(
     max_context: int,
 ) -> None:
     """对每个有足够新消息的群尝试主动插一句。"""
+    if botctl.is_paused():
+        return
     bot = _pick_bot()
     if bot is None:
         return
@@ -222,6 +225,8 @@ async def run_private_care_tick(
     whitelist: set[str],
 ) -> None:
     """对久未私聊的高关系用户，偶尔发一句轻量关心。"""
+    if botctl.is_paused():
+        return
     bot = _pick_bot()
     if bot is None:
         return

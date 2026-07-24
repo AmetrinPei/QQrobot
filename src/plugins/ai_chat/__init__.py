@@ -29,9 +29,11 @@ from nonebot.plugin import PluginMetadata
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, field_validator
 
+from . import bot_control as botctl
 from . import bubble
 from . import memory as mem
 from . import mood
+from . import persona_overlay as persona_ov
 from . import proactive as pro
 from . import session as sess
 from . import time_context as tctx
@@ -43,6 +45,13 @@ ADMIN_CMD_PREFIXES = (
     "/记住",
     "/忘掉",
     "/长期记忆",
+    "/人设",
+    "/形象",
+    "/启动",
+    "/停止",
+    "/开",
+    "/关",
+    "/状态",
     "/备注",
     "/关系",
     "/心情",
@@ -179,7 +188,7 @@ __plugin_meta__ = PluginMetadata(
         "私聊直接发消息；群聊 @机器人；@ 后短时间内跟进消息必要时会接；"
         "多人同时聊时回复带 @；定时旁听群聊必要时主动接一句。"
         "人设见 persona.txt。"
-        "管理员私聊：/备注 /关系 /心情 /忘记短期 /记忆列表 /记住 /忘掉 /长期记忆"
+        "管理员私聊：/备注 /关系 /心情 /记住 /人设 /形象 /启动 /停止 /状态 /忘记短期 /记忆列表 /忘掉 /长期记忆"
     ),
     config=Config,
 )
@@ -201,11 +210,8 @@ logger.info(
 
 
 def load_system_prompt() -> str:
-    if PERSONA_FILE.is_file():
-        text = PERSONA_FILE.read_text(encoding="utf-8").strip()
-        if text:
-            return text
-    return "你是一个有用的QQ助手，回答简洁清晰。"
+    """本地 persona + 管理员人设/形象覆盖（管理员优先）。"""
+    return persona_ov.load_full_persona()
 
 
 def parse_admin_ids() -> set[str]:
@@ -669,15 +675,15 @@ async def handle_admin_memory_cmd(
     if text.startswith("/记住"):
         content = text[len("/记住") :].strip()
         if not content:
-            return "用法：/记住 内容"
+            return "用法：/记住 内容\n（管理员记忆优先于自动抽取，冲突时以管理员为准）"
         banned = mem.is_forbidden_fact(content)
         if banned:
             return f"拒绝记住：{banned}"
         try:
-            mem.add_fact(content, scope="global", source="manual")
+            mem.add_fact(content, scope="global", source="admin")
         except ValueError as e:
             return f"拒绝记住：{e}"
-        return f"记住了：{content}"
+        return f"已优先记住：{content}"
 
     if text.startswith("/忘掉"):
         keyword = text[len("/忘掉") :].strip()
@@ -689,6 +695,71 @@ async def handle_admin_memory_cmd(
         preview = "；".join(deleted[:5])
         extra = f" 等共 {len(deleted)} 条" if len(deleted) > 5 else ""
         return f"已忘掉：{preview}{extra}"
+
+    # ----- 人设 / 形象（管理员优先覆盖本地 persona.txt）-----
+    if text == "/人设" or text.startswith("/人设 "):
+        arg = text[len("/人设") :].strip()
+        ov = persona_ov.get_overlay()
+        if not arg:
+            body = (ov.get("content") or "").strip() or "（空）"
+            if len(body) > 1200:
+                body = body[:1200] + "…"
+            return (
+                "当前管理员人设修订（优先于 persona.txt）：\n"
+                f"{body}\n\n"
+                "用法：\n"
+                "/人设 内容 —— 覆盖写入\n"
+                "/人设追加 内容 —— 追加\n"
+                "/人设清空 —— 清空修订"
+            )
+        if arg in ("清空", "清除", "reset"):
+            persona_ov.clear_persona(updated_by=event.user_id)
+            return "已清空管理员人设修订。"
+        if arg.startswith("追加 ") or arg.startswith("追加\n"):
+            extra = arg[len("追加") :].strip()
+            if not extra:
+                return "用法：/人设追加 内容"
+            persona_ov.append_overlay(extra, updated_by=event.user_id)
+            return f"已追加人设修订：{extra[:200]}{'…' if len(extra) > 200 else ''}"
+        persona_ov.set_overlay(content=arg, updated_by=event.user_id)
+        return f"已更新人设修订（优先生效）：{arg[:200]}{'…' if len(arg) > 200 else ''}"
+
+    if text == "/形象" or text.startswith("/形象 "):
+        arg = text[len("/形象") :].strip()
+        ov = persona_ov.get_overlay()
+        if not arg:
+            body = (ov.get("appearance") or "").strip() or "（空）"
+            if len(body) > 1200:
+                body = body[:1200] + "…"
+            return (
+                "当前管理员形象设定（优先于 persona.txt）：\n"
+                f"{body}\n\n"
+                "用法：\n"
+                "/形象 描述 —— 覆盖写入（外貌/头像/气质等）\n"
+                "/形象清空 —— 清空形象设定"
+            )
+        if arg in ("清空", "清除", "reset"):
+            persona_ov.clear_appearance(updated_by=event.user_id)
+            return "已清空管理员形象设定。"
+        persona_ov.set_overlay(appearance=arg, updated_by=event.user_id)
+        return f"已更新形象设定（优先生效）：{arg[:200]}{'…' if len(arg) > 200 else ''}"
+
+    # ----- 启停 -----
+    if text in ("/启动", "/开", "/开始"):
+        botctl.set_paused(False)
+        return "机器人已启动，开始正常回复。"
+    if text in ("/停止", "/关", "/暂停"):
+        botctl.set_paused(True)
+        return "机器人已停止。普通消息不再回复；私聊发 /启动 可恢复。"
+    if text in ("/状态",):
+        ov = persona_ov.get_overlay()
+        has_p = bool((ov.get("content") or "").strip())
+        has_a = bool((ov.get("appearance") or "").strip())
+        return (
+            f"状态：{botctl.status_text()}\n"
+            f"管理员人设修订：{'有' if has_p else '无'}\n"
+            f"管理员形象设定：{'有' if has_a else '无'}"
+        )
 
     return None
 
@@ -707,10 +778,16 @@ async def handle_chat(bot: Bot, event: MessageEvent):
         and vis.is_image_followup_candidate(event)
     )
 
+    # 管理员私聊指令：即使机器人已停止也可执行（含 /启动）
     if isinstance(event, PrivateMessageEvent) and text.startswith("/"):
         cmd_reply = await handle_admin_memory_cmd(bot, event, text)
         if cmd_reply is not None:
             await chat.finish(cmd_reply)
+
+    # 停止状态：非管理员指令一律静默
+    if botctl.is_paused():
+        logger.info(f"机器人已停止，忽略消息 user={event.user_id}")
+        await chat.finish()
 
     # 关闭识图：含图片的消息一律静默不回
     if image_urls and not config.vision_enabled:
