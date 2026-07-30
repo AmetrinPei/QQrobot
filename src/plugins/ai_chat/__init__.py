@@ -39,6 +39,11 @@ from . import session as sess
 from . import time_context as tctx
 from . import vigilance as vig
 from . import vision as vis
+from . import tool_router
+from . import web_search
+from . import url_reader
+from . import image_send
+from . import sticker_manager as sticker
 from .paths import PERSONA_FILE
 
 ADMIN_CMD_PREFIXES = (
@@ -113,6 +118,10 @@ class Config(BaseModel):
         default=None,
         description="已弃用，请用 group_followup_seconds",
     )
+    group_image_trigger_seconds: int = Field(
+        default=300,
+        description="群内机器人发言后多少秒内，图片/梗图消息可宽松触发回复",
+    )
     group_at_when_active: int = Field(
         default=2,
         description="群内窗口内互动人数 >= 该值时，回复前加 @对方",
@@ -153,12 +162,44 @@ class Config(BaseModel):
         description="同一人两次主动关心最短间隔（秒，默认 2 天）",
     )
     private_proactive_min_tier: str = Field(
-        default="朋友",
-        description="主动关心最低亲疏：熟人/朋友/家人",
+        default="熟人",
+        description="主动关心最低亲疏：熟人",
     )
     private_proactive_whitelist: str = Field(
         default="",
         description="可选 QQ 白名单（逗号分隔）；非空则只关心名单内用户",
+    )
+    # 联网搜索（工具调用）
+    web_search_enabled: bool = Field(
+        default=False,
+        description="是否启用联网搜索工具（AI 自主判断触发）",
+    )
+    web_search_timeout: float = Field(
+        default=10.0,
+        description="联网搜索超时（秒）",
+    )
+    web_search_max_results: int = Field(
+        default=5,
+        description="每次搜索最多返回几条结果",
+    )
+    # 链接识别
+    url_reader_enabled: bool = Field(
+        default=True,
+        description="用户发链接时自动抓取网页内容注入上下文",
+    )
+    # AI 绘图
+    image_gen_enabled: bool = Field(
+        default=False,
+        description="是否启用 AI 绘图工具",
+    )
+    image_gen_model: str = Field(
+        default="black-forest-labs/FLUX.1-schnell",
+        description="图片生成模型",
+    )
+    # 表情包
+    sticker_enabled: bool = Field(
+        default=True,
+        description="是否启用表情包收集与发送",
     )
 
     @field_validator("private_proactive_whitelist", mode="before")
@@ -208,6 +249,30 @@ logger.info(
     f"key=...{(config.siliconflow_api_key or '')[-4:]}"
 )
 
+# ---------- 工具注册 ----------
+if config.web_search_enabled:
+    tool_router.register_tool("web_search", web_search.search_web)
+    logger.info("联网搜索工具已启用")
+else:
+    logger.info("联网搜索工具未启用（WEB_SEARCH_ENABLED=false）")
+
+if config.image_gen_enabled:
+    tool_router.register_tool("image_gen", image_send.handle)
+    logger.info(f"AI 绘图工具已启用（model={config.image_gen_model}）")
+
+if config.sticker_enabled:
+    tool_router.register_tool("send_sticker", sticker.handle)
+    logger.info("表情包工具已启用")
+
+
+def get_image_gen_config() -> tuple[str, str, str]:
+    """image_send 模块用：返回 (api_key, base_url, model)。"""
+    return (
+        config.siliconflow_api_key,
+        config.siliconflow_base_url,
+        config.image_gen_model,
+    )
+
 
 def load_system_prompt() -> str:
     """本地 persona + 管理员人设/形象覆盖（管理员优先）。"""
@@ -247,6 +312,20 @@ def speaker_label(event: MessageEvent) -> str:
     return label
 
 
+def get_tool_prompt() -> str:
+    """根据已启用的工具生成 system prompt 中的工具说明。"""
+    parts: list[str] = []
+    if config.web_search_enabled:
+        parts.append(web_search.TOOL_DESCRIPTION)
+    if config.image_gen_enabled:
+        parts.append(image_send.TOOL_DESCRIPTION)
+    if config.sticker_enabled:
+        parts.append(sticker.TOOL_DESCRIPTION)
+    if not parts:
+        return ""
+    return "\n\n".join(parts)
+
+
 def build_system_prompt(
     *,
     scene: str,
@@ -254,7 +333,7 @@ def build_system_prompt(
     relation_tier: str | None = None,
     user_id: int | str | None = None,
 ) -> str:
-    """组装完整 system：人设 + 时间 + 情绪 + 关系 + 气泡提示。"""
+    """组装完整 system：人设 + 时间 + 情绪 + 关系 + 气泡提示 + 工具说明。"""
     mood.apply_time_drift()
     parts = [
         load_system_prompt(),
@@ -263,6 +342,9 @@ def build_system_prompt(
         bubble.BUBBLE_HINT,
         f"当前场景：{scene}。请按上述人设与边界回答。",
     ]
+    tool_prompt = get_tool_prompt()
+    if tool_prompt:
+        parts.append(tool_prompt)
     if user_id is not None and vig.is_alert(user_id):
         note = vig.format_vigilance_for_prompt(user_id)
         if note:
@@ -340,8 +422,29 @@ def is_group_followup(event: MessageEvent) -> bool:
     return True
 
 
+def is_group_image_trigger(event: MessageEvent) -> bool:
+    """宽松触发：群内有人发图/表情，且机器人近期在该群说过话。
+
+    不要求发送者本人跟机器人互动过——只要群里最近有机器人的对话，
+    图片消息就有较大概率是在接梗/回应，值得让模型判断是否回复。
+    """
+    if not isinstance(event, GroupMessageEvent):
+        return False
+    if event.is_tome() or is_reply_to_me(event):
+        return False  # 已被其他规则覆盖
+    if message_at_others_only(event):
+        return False
+    if not config.vision_enabled:
+        return False
+    if not vis.message_has_image(event):
+        return False
+    return pro.bot_recently_spoke_in_group(
+        event.group_id, config.group_image_trigger_seconds
+    )
+
+
 async def should_handle_message(event: MessageEvent) -> bool:
-    """私聊一律；群聊 @ / 回复机器人 / 互动窗口内的跟进消息。"""
+    """私聊一律；群聊 @ / 回复机器人 / 跟进消息 / 近期有对话时的图片。"""
     if isinstance(event, PrivateMessageEvent):
         return True
     if event.is_tome():
@@ -349,6 +452,8 @@ async def should_handle_message(event: MessageEvent) -> bool:
     if is_reply_to_me(event):
         return True
     if is_group_followup(event):
+        return True
+    if is_group_image_trigger(event):
         return True
     return False
 
@@ -379,6 +484,21 @@ async def _collect_group_chat(event: GroupMessageEvent):
         has_image=vis.message_has_image(event),
         message_id=getattr(event, "message_id", None),
     )
+    # ---------- 表情包自动收集 + 视觉模型打标 ----------
+    if config.sticker_enabled:
+        sticker_url = sticker.get_sticker_url(event)
+        if sticker_url and not sticker.has_sticker(sticker_url):
+            async def _save_and_tag():
+                ok = await sticker.collect_sticker(
+                    sticker_url, source_group=str(event.group_id)
+                )
+                if ok and config.vision_enabled:
+                    await sticker.auto_tag_sticker(
+                        client,
+                        model=config.siliconflow_vision_model,
+                        url=sticker_url,
+                    )
+            asyncio.create_task(_save_and_tag())
 
 
 @get_driver().on_startup
@@ -386,7 +506,7 @@ async def _start_proactive_loop():
     if not config.siliconflow_api_key or "粘贴" in config.siliconflow_api_key:
         logger.warning("未配置 API Key，跳过主动任务")
         return
-    # 启动时对齐一次作息精力
+    # 启动时初始化心情状态
     try:
         mood.apply_time_drift()
     except Exception as e:
@@ -574,28 +694,23 @@ async def handle_admin_memory_cmd(
             st = mood.get_state()
             trigger = st.get("last_trigger") or "无"
             return (
-                f"当前心情：{st['mood']}，精力 {st['energy']}/100\n"
+                f"当前心情：{st['mood']}\n"
                 f"最近触发：{trigger}"
             )
         if arg in ("重置", "reset"):
-            mood.set_state(mood="平静", energy=70, last_trigger="管理员重置")
-            return "已重置心情为平静、精力 70。"
-        parts = arg.split(None, 1)
-        m = parts[0]
+            mood.set_state(mood="平静", last_trigger="管理员重置")
+            return "已重置心情为平静。"
+        m = arg.split()[0]
         if m not in mood.VALID_MOODS:
-            return f"用法：/心情\n或：/心情 平静|开心|害羞|委屈|烦躁 [精力0-100]\n或：/心情 重置"
-        energy = None
-        if len(parts) > 1 and parts[1].isdigit():
-            energy = int(parts[1])
-        mood.set_state(mood=m, energy=energy, last_trigger="管理员设定")
-        st = mood.get_state()
-        return f"已设定心情：{st['mood']}，精力 {st['energy']}/100"
+            return f"用法：/心情\n或：/心情 平静|开心|害羞|委屈|烦躁\n或：/心情 重置"
+        mood.set_state(mood=m, last_trigger="管理员设定")
+        return f"已设定心情：{m}"
 
     if text.startswith("/关系"):
         rest = text[len("/关系") :].strip()
         if not rest:
             return (
-                "用法：/关系 QQ号 陌生人|熟人|朋友|家人\n"
+                "用法：/关系 QQ号 陌生人|熟人\n"
                 "查看：/关系 QQ号\n"
                 f"可选等级：{'/'.join(sess.VALID_TIERS)}"
             )
@@ -777,6 +892,11 @@ async def handle_chat(bot: Bot, event: MessageEvent):
         and followup
         and vis.is_image_followup_candidate(event)
     )
+    # 宽松图片触发：bot 近期在群里说过话，有人发了图/梗图
+    image_trigger = (
+        not followup
+        and is_group_image_trigger(event)
+    )
 
     # 管理员私聊指令：即使机器人已停止也可执行（含 /启动）
     if isinstance(event, PrivateMessageEvent) and text.startswith("/"):
@@ -795,7 +915,7 @@ async def handle_chat(bot: Bot, event: MessageEvent):
         await chat.finish()
 
     if not text and not image_urls:
-        if followup:
+        if followup or image_trigger:
             await chat.finish()
         await chat.finish("说点什么吧~")
 
@@ -811,6 +931,21 @@ async def handle_chat(bot: Bot, event: MessageEvent):
         is_private=isinstance(event, PrivateMessageEvent),
     )
 
+    # 提前取短期历史：既供识图语境，也供后续模型调用
+    sk = current_session_key(event)
+    history = sess.get_history(sk)
+
+    # 为视觉模型准备近期对话摘要（最多 6 条）
+    vision_context = ""
+    if history:
+        recent = history[-6:]
+        ctx_lines = []
+        for msg in recent:
+            role = "你" if msg["role"] == "assistant" else "对方"
+            content_preview = msg["content"][:120]
+            ctx_lines.append(f"{role}：{content_preview}")
+        vision_context = "\n".join(ctx_lines)
+
     # ----- 识图（仅 vision_enabled 时）-----
     image_description = ""
     if image_urls and config.vision_enabled:
@@ -819,13 +954,15 @@ async def handle_chat(bot: Bot, event: MessageEvent):
             model=config.siliconflow_vision_model,
             image_urls=image_urls,
             user_hint=text,
+            chat_context=vision_context,
         )
         if not image_description and not text:
-            if followup or vis.is_sticker_like(event):
+            if followup or image_trigger or vis.is_sticker_like(event):
                 user_content = (
                     "[用户发来表情包或图片，具体内容未能识别。"
-                    "若刚才在和你聊、接一下比较自然，就按人设回一句；"
-                    "若没什么可接的，只输出 "
+                    "刚才你们在聊天，这大概率是在表达情绪或随手反应。"
+                    "你也本能地短回一句就行，不必刻意搞笑；"
+                    "只有完全确定与你无关时，才只输出 "
                     f"{NO_REPLY_TOKEN} 。]"
                 )
             else:
@@ -857,19 +994,24 @@ async def handle_chat(bot: Bot, event: MessageEvent):
         if followup_image:
             user_content = (
                 f"{user_content}\n"
-                "（这是对方刚和你聊完后发来的图/表情，可视为对你说话；"
-                f"若完全不必接，只输出 {NO_REPLY_TOKEN}。）"
+                "（对方刚和你聊完就发了这张图/表情，当作随手分享或情绪表达。"
+                "像真人一样本能短回就行——一个词、一句感叹都可以，不必硬凑幽默；"
+                f"只有百分之百确定与你无关时才输出 {NO_REPLY_TOKEN}。）"
             )
         else:
             user_content = f"{user_content}\n（{FOLLOWUP_JUDGE_NOTE}）"
+    elif image_trigger:
+        user_content = (
+            f"{user_content}\n"
+            "（你刚才在这个群里说过话，之后对方发了这张图/表情。"
+            "如果跟你之前的话题或情绪有点关联，随手反应一下就好，别写长；"
+            f"如果明显与你无关，只输出 {NO_REPLY_TOKEN}。）"
+        )
 
     speaker = speaker_label(event)
     relation_tier = sess.get_tier(event.user_id)
     prompt_tier = vig.effective_relation_tier(event.user_id, relation_tier)
     user_content_for_model = f"说话人：{speaker}\n{user_content}"
-
-    sk = current_session_key(event)
-    history = sess.get_history(sk)
 
     scene = "私聊" if isinstance(event, PrivateMessageEvent) else "群聊"
     full_system = build_system_prompt(
@@ -888,13 +1030,35 @@ async def handle_chat(bot: Bot, event: MessageEvent):
         if facts_block:
             full_system = f"{full_system}\n\n{facts_block}"
 
+    # ---------- 链接识别：自动抓取网页内容注入上下文 ----------
+    if config.url_reader_enabled:
+        msg_urls = url_reader.extract_urls(event)
+        for link in msg_urls:
+            page_text = await url_reader.fetch_url_text(link)
+            if page_text:
+                user_content_for_model += (
+                    "\n\n" + url_reader.format_url_context(link, page_text)
+                )
+                logger.info(f"链接识别 user={event.user_id} url={link[:60]}")
+
+    # ---------- 多模态：图片+文字一次性传给视觉模型 ----------
+    use_multimodal = bool(image_urls and config.vision_enabled)
+    if use_multimodal:
+        model_user_content: str | list = vis.build_multimodal_content(
+            user_content_for_model, image_urls
+        )
+        active_model = config.siliconflow_vision_model
+    else:
+        model_user_content = user_content_for_model
+        active_model = config.siliconflow_model
+
     messages: list[dict] = [{"role": "system", "content": full_system}]
     messages.extend(history)
-    messages.append({"role": "user", "content": user_content_for_model})
+    messages.append({"role": "user", "content": model_user_content})
 
     try:
         response = await client.chat.completions.create(
-            model=config.siliconflow_model,
+            model=active_model,
             messages=messages,
             max_tokens=1024,
             temperature=0.7,
@@ -903,21 +1067,66 @@ async def handle_chat(bot: Bot, event: MessageEvent):
         await chat.finish(f"调用模型失败：{e}")
 
     reply = (response.choices[0].message.content or "").strip()
+
+    # ---------- 工具调用（AI 自主触发，每轮最多一次）----------
+    generated_image_url: str | None = None
+    sticker_file: str | None = None
+    if reply and tool_router.has_tool_call(reply):
+        call = tool_router.parse_tool_call(reply)
+        if call:
+            logger.info(
+                f"触发工具调用 user={event.user_id} "
+                f"tool={call.name} params={call.params!r}"
+            )
+            tool_result = await tool_router.execute_tool(
+                call, timeout=config.web_search_timeout + 5
+            )
+            # 检测图片生成结果
+            generated_image_url = image_send.extract_image_url_from_result(
+                tool_result
+            )
+            # 检测表情包结果
+            sticker_file = sticker.extract_sticker_file(tool_result)
+            messages.append({"role": "assistant", "content": reply})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": tool_router.format_tool_result_for_prompt(
+                        call, tool_result
+                    ),
+                }
+            )
+            try:
+                response2 = await client.chat.completions.create(
+                    model=config.siliconflow_model,
+                    messages=messages,
+                    max_tokens=1024,
+                    temperature=0.7,
+                )
+                reply = (response2.choices[0].message.content or "").strip()
+            except Exception as e:
+                logger.warning(f"工具调用后二次模型调用失败：{e}")
+                # 回退：若搜索结果本身有内容，直接告知用户
+                if "[搜索失败]" not in tool_result and "[工具出错]" not in tool_result:
+                    reply = f"帮你查了一下：\n{tool_result[:800]}"
+                else:
+                    reply = ""
+
     if not reply:
-        if followup:
+        if followup or image_trigger:
             await chat.finish()
         await chat.finish("模型返回了空内容。")
 
-    # 跟进消息：模型判断不必回则静默
-    if followup and _is_no_reply(reply):
-        logger.info(f"跟进消息判定无需回复 user={event.user_id}")
+    # 跟进/宽松图片触发：模型判断不必回则静默
+    if (followup or image_trigger) and _is_no_reply(reply):
+        logger.info(f"跟进/图片消息判定无需回复 user={event.user_id}")
         await chat.finish()
 
     # 强制去掉括号动作 / 困倦口头禅（分段发送前还会再润色短句句号）
     reply = bubble.strip_stage_directions(reply)
     reply = bubble.strip_sleepy_talk(reply)
     if not reply:
-        if followup:
+        if followup or image_trigger:
             await chat.finish()
         await chat.finish("……")
 
@@ -950,6 +1159,20 @@ async def handle_chat(bot: Bot, event: MessageEvent):
             )
         else:
             await chat.send(merged)
+
+    # ---------- 发送生成的图片（AI 绘图工具）----------
+    if generated_image_url:
+        try:
+            await chat.send(MessageSegment.image(generated_image_url))
+        except Exception as e:
+            logger.warning(f"发送图片失败：{e}")
+
+    # ---------- 发送表情包 ----------
+    if sticker_file:
+        try:
+            await chat.send(MessageSegment.image(f"file:///{sticker_file}"))
+        except Exception as e:
+            logger.warning(f"发送表情包失败：{e}")
 
     # 对该攻击者已回应一次：后续重复攻击话题静默，直到解除
     if vig.is_alert(event.user_id):

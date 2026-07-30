@@ -15,6 +15,9 @@ BUBBLE_HINT = (
     "可偶尔带一个常见表情（🙂😂😅🙄😏），别每段都加。"
     "只有真正很长的完整罗列才不要拆，保持一整段；长说明可用句号。"
     "群聊最多三段，私聊最多四段；禁止圆括号动作描写。"
+    "严禁小作文结构：不要「观察→展开描述→反问收尾」三段式；"
+    "不要复述/描述图片内容再点评——像真人一样本能反应，想到什么说什么。"
+    "纯反应词（草、绷、？、哈哈哈、什么玩意）本身就是完整回复，不必硬凑后文。"
 )
 
 # 舞台动作：（歪头） / (翻白眼) 等；过长括号多半是正常说明，保留
@@ -148,7 +151,14 @@ def split_bubbles(
         parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
         if len(parts) < 2:
             parts = [text]
-    # 4) 短句闲聊按句拆
+    # 4) 单换行多行短文本：每行独立成段（模型没用 --- 但换行了）
+    elif "\n" in text:
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        if 2 <= len(lines) <= limit and all(len(l) <= 60 for l in lines):
+            parts = lines
+        else:
+            parts = [text]
+    # 5) 短句闲聊按句拆
     else:
         sent = _split_by_sentences(text, limit=limit)
         parts = sent if sent else [text]

@@ -1,4 +1,4 @@
-"""轻量情绪/精力状态：持久化并注入 prompt。"""
+"""轻量情绪状态：持久化并注入 prompt（已移除精力系统，仅保留心情标签）。"""
 
 from __future__ import annotations
 
@@ -11,14 +11,12 @@ from .paths import DATA_DIR, DB_PATH
 
 VALID_MOODS = ("平静", "开心", "害羞", "委屈", "烦躁")
 DEFAULT_MOOD = "平静"
-DEFAULT_ENERGY = 70
 
 _HAPPY_RE = re.compile(
     r"(哈哈|开心|喜欢你|真棒|好厉害|可爱|摸摸|抱抱|夸|谢谢你|爱你)"
 )
 _SHY_RE = re.compile(r"(好看|好帅|好可爱|喜欢米米|喜欢你|亲一下)")
 _SAD_RE = re.compile(r"(笨蛋|去死|滚|讨厌你|闭嘴|傻|烦死|骂)")
-# 对方反复问、或表示没听懂时触发烦躁
 _ANNOYED_RE = re.compile(
     r"(又说|不是说了|不是刚说|刚不是|听不懂|没听懂|再说一遍|再问一遍|"
     r"讲了半天|说了半天|怎么还|还是不懂|又问|同一个问题|我刚才|"
@@ -46,9 +44,9 @@ def _connect() -> sqlite3.Connection:
         conn.execute(
             """
             INSERT INTO bot_mood (id, mood, energy, last_trigger, updated_at)
-            VALUES (1, ?, ?, NULL, ?)
+            VALUES (1, ?, 70, NULL, ?)
             """,
-            (DEFAULT_MOOD, DEFAULT_ENERGY, time.time()),
+            (DEFAULT_MOOD, time.time()),
         )
     conn.commit()
     return conn
@@ -57,23 +55,15 @@ def _connect() -> sqlite3.Connection:
 def get_state() -> dict[str, Any]:
     with _connect() as conn:
         row = conn.execute(
-            "SELECT mood, energy, last_trigger, updated_at FROM bot_mood WHERE id = 1"
+            "SELECT mood, last_trigger, updated_at FROM bot_mood WHERE id = 1"
         ).fetchone()
     if not row:
-        return {
-            "mood": DEFAULT_MOOD,
-            "energy": DEFAULT_ENERGY,
-            "last_trigger": None,
-            "updated_at": time.time(),
-        }
+        return {"mood": DEFAULT_MOOD, "last_trigger": None, "updated_at": time.time()}
     mood = str(row["mood"] or DEFAULT_MOOD)
     if mood not in VALID_MOODS:
         mood = DEFAULT_MOOD
-    energy = int(row["energy"] if row["energy"] is not None else DEFAULT_ENERGY)
-    energy = max(0, min(100, energy))
     return {
         "mood": mood,
-        "energy": energy,
         "last_trigger": row["last_trigger"],
         "updated_at": float(row["updated_at"] or time.time()),
     }
@@ -82,85 +72,43 @@ def get_state() -> dict[str, Any]:
 def set_state(
     *,
     mood: str | None = None,
-    energy: int | None = None,
+    energy: int | None = None,  # 保留参数兼容，忽略
     last_trigger: str | None = None,
 ) -> dict[str, Any]:
     cur = get_state()
     new_mood = mood if mood in VALID_MOODS else cur["mood"]
-    new_energy = cur["energy"] if energy is None else max(0, min(100, int(energy)))
     trigger = last_trigger if last_trigger is not None else cur["last_trigger"]
     now = time.time()
     with _connect() as conn:
         conn.execute(
             """
-            UPDATE bot_mood
-            SET mood = ?, energy = ?, last_trigger = ?, updated_at = ?
+            UPDATE bot_mood SET mood = ?, last_trigger = ?, updated_at = ?
             WHERE id = 1
             """,
-            (new_mood, new_energy, trigger, now),
+            (new_mood, trigger, now),
         )
         conn.commit()
     return get_state()
 
 
-def _energy_label(energy: int) -> str:
-    if energy >= 75:
-        return "精力充沛"
-    if energy >= 45:
-        return "精力正常"
-    if energy >= 25:
-        return "略懒"
-    return "略懒"
-
-
 def format_mood_for_prompt(state: dict[str, Any] | None = None) -> str:
     st = state or get_state()
     mood = st["mood"]
-    energy = int(st["energy"])
-    # 展示时抬高下限，避免模型把「低精力」演成「困了」
-    shown = max(energy, 70)
-    label = _energy_label(shown)
     extra = ""
     if st.get("last_trigger"):
         extra = f"\n最近心情触发：{st['last_trigger']}（不必主动提起）。"
     return (
-        f"你当前的内在状态：心情「{mood}」，{label}。\n"
-        "请让语气轻微符合这个状态，但仍遵守人设；"
-        "心情「烦躁」时语气可以更冲、毒舌可以更狠，但不骂脏话、不人身攻击；"
-        "严禁主动说「困了」「好困」「想睡」「没精神」「去睡觉」「熬不住」等；"
-        "就算很晚也只把话说短一点，不要拿困当口头禅；"
+        f"你当前心情：「{mood}」。\n"
+        "语气轻微符合即可，仍遵守人设；"
+        "「烦躁」时语气可以更冲、毒舌更狠，但不骂脏话；"
         "不要自我分析心情，不要说「我现在的状态是……」。"
         f"{extra}"
     )
 
 
-_last_drift_hour: int | None = None
-
-
 def apply_time_drift(hour: int | None = None) -> dict[str, Any]:
-    """按钟点缓慢调整精力；同一小时内最多改一次，避免每条消息狂掉精力。"""
-    from datetime import datetime
-
-    global _last_drift_hour
-    h = datetime.now().hour if hour is None else hour
-    st = get_state()
-    if _last_drift_hour == h:
-        return st
-    _last_drift_hour = h
-
-    energy = int(st["energy"])
-    mood = st["mood"]
-
-    if h >= 23 or h < 5:
-        energy = max(55, energy - 1)
-    elif 5 <= h < 9:
-        energy = min(85, energy + 5)
-    elif 9 <= h < 18:
-        energy = min(95, energy + 3)
-    else:
-        energy = max(60, energy - 1)
-
-    return set_state(mood=mood, energy=energy)
+    """已简化：不再按时间调整精力，直接返回当前状态。"""
+    return get_state()
 
 
 def update_after_turn(
@@ -170,40 +118,27 @@ def update_after_turn(
     is_private: bool = False,
     relation_tier: str = "陌生人",
 ) -> dict[str, Any]:
-    """根据本轮对话用轻量规则更新心情/精力。"""
+    """根据本轮对话用轻量规则更新心情（无精力变动）。"""
     st = get_state()
     mood = st["mood"]
-    energy = int(st["energy"])
     trigger: str | None = None
     text = (user_text or "").strip()
 
-    # 自然消耗：每轮略降，私聊稍多一点互动回血
-    if is_private:
-        energy = min(100, energy + 1)
-    else:
-        energy = max(10, energy - 1)
-
     if _SAD_RE.search(text):
         mood = "委屈"
-        energy = max(20, energy - 10)
         trigger = "被说了重话"
     elif _SHY_RE.search(text):
         mood = "害羞"
-        energy = min(100, energy + 3)
         trigger = "被夸/亲近"
     elif _HAPPY_RE.search(text):
         mood = "开心"
-        energy = min(100, energy + 6)
         trigger = "开心互动"
     elif _ANNOYED_RE.search(text):
         mood = "烦躁"
-        energy = max(20, energy - 4)
-        trigger = "对方反复问/听不懂"
-    elif relation_tier in ("家人", "朋友") and is_private:
-        # 熟人私聊温和回升
+        trigger = "对方反复追问"
+    elif relation_tier == "熟人" and is_private:
         if mood in ("委屈", "烦躁"):
             mood = "平静"
             trigger = "和熟人聊开了"
-        energy = min(100, energy + 2)
 
-    return set_state(mood=mood, energy=energy, last_trigger=trigger)
+    return set_state(mood=mood, last_trigger=trigger)

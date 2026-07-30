@@ -10,4 +10,5 @@ venv/
 .vscode/
 data/
 *.db
+*.egg-info/
 

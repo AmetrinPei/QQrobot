@@ -14,17 +14,22 @@ from openai import AsyncOpenAI
 from .paths import DATA_DIR, DB_PATH
 
 EXTRACT_SYSTEM = """你是记忆抽取助手。根据一轮对话，判断是否有「值得长期记住」的事实。
-规则：
+
+规则（只有 3 条）：
 1. 只输出 JSON 数组，每项是一句简短中文事实；没有则输出 []
-2. 最多 3 条；只记与「说话人」相关、或对方明确要求记住的内容
-3. 事实必须写清主体姓名/称呼（如「闪闪姐姐…」「小泥哥哥…」），禁止写「用户」「对方」这种无主体句
-4. 只记用户侧信息；禁止把助手自己的口头禅、推荐、观点、自称写成用户的事实
-5. 不记：密码、验证码、隐私八卦、一时情绪、无意义闲聊、玩笑挑拨、群吹水
-6. 不记已在人设里的设定；不编造对话里没有的信息
-7. 称呼纠正（如「我是姐姐不是哥哥」）优先记准；正常亲友称呼（哥哥/姐姐/昵称）可以记
-8. 【硬性禁止】不记任何占便宜、调戏、下流意味的称呼要求，例如：叫爸爸/叫爹/daddy、欧豆桑/欧多桑/欧吉桑、叫老公/叫老婆、叫主人/奴隶等。这类一律输出 [] 或跳过该条
-9. 【硬性禁止】对话含辱骂、威胁、挑拨身份、性骚扰等攻击意图时，整轮不要抽取任何事实，输出 []
-示例输出：["闪闪姐姐不喜欢被骂","小泥哥哥希望被叫做泥哥"]"""
+2. 只记与「说话人」相关的真实信息（姓名、喜好、身份、关系、明确要求记住的事）
+3. 不记：闲聊、情绪、玩笑、辱骂、占便宜称呼、对话中没有的信息
+
+示例：
+对话：“说话人：泥哥(QQ:123，熟人)\n用户：我明天要考研了\n助手：加油！”
+输出：["泥哥正在考研"]
+
+对话：“说话人：陌生人A(QQ:456，陌生人)\n用户：哈哈哈笑死\n助手：哈哈哈”
+输出：[]
+
+对话：“说话人：闪闪(QQ:789，熟人)\n用户：记住我不喜欢吃香菜\n助手：好呀记住了”
+输出：["闪闪不喜欢吃香菜"]
+"""
 
 
 # 占便宜 / 下流称呼：抽取与手动 /记住 一律拦截
@@ -331,8 +336,8 @@ async def extract_and_store(
                 {"role": "system", "content": EXTRACT_SYSTEM},
                 {"role": "user", "content": user_payload},
             ],
-            max_tokens=256,
-            temperature=0.2,
+            max_tokens=128,
+            temperature=0.1,
         )
         raw = (response.choices[0].message.content or "").strip()
         facts = _parse_facts_json(raw)
@@ -346,6 +351,11 @@ async def extract_and_store(
         if banned:
             logger.info(f"跳过禁止类长期记忆：{fact}（{banned}）")
             continue
+        # 去重：已存在相同内容则跳过
+        existing = delete_by_keyword(fact, scope=scope)
+        if existing:
+            # 删了旧的再写新的（等价于更新）
+            pass
         try:
             add_fact(fact, scope=scope, source="auto")
             stored.append(fact)

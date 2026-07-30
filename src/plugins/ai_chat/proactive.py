@@ -88,6 +88,12 @@ def mark_bot_spoke(group_id: int) -> None:
     _last_bot_speak_ts[int(group_id)] = time.time()
 
 
+def bot_recently_spoke_in_group(group_id: int, window_seconds: int) -> bool:
+    """机器人是否在 window_seconds 秒内在该群说过话。"""
+    last = _last_bot_speak_ts.get(int(group_id), 0.0)
+    return (time.time() - last) < window_seconds
+
+
 def _new_lines_since(group_id: int, since_ts: float) -> list[GroupChatLine]:
     return [line for line in _buffers[int(group_id)] if line.ts > since_ts]
 

@@ -10,21 +10,12 @@ from typing import Any
 # 与 memory.py 共用同一库文件
 from .paths import DATA_DIR, DB_PATH
 
-# 亲疏等级（由疏到亲）
+# 亲疏等级（简化为两级）
 TIER_STRANGER = "陌生人"
-TIER_ACQUAINTANCE = "熟人"
-TIER_FRIEND = "朋友"
-TIER_FAMILY = "家人"
-VALID_TIERS = (TIER_STRANGER, TIER_ACQUAINTANCE, TIER_FRIEND, TIER_FAMILY)
-TIER_RANK = {
-    TIER_STRANGER: 0,
-    TIER_ACQUAINTANCE: 1,
-    TIER_FRIEND: 2,
-    TIER_FAMILY: 3,
-}
-# 自动升档上限：互动再多也只到「熟人」，朋友/家人需手动设
-AUTO_TIER_CAP = TIER_ACQUAINTANCE
-AUTO_BUMP_THRESHOLD = 8  # 累计互动次数达到后可升到熟人
+TIER_FAMILIAR = "熟人"
+VALID_TIERS = (TIER_STRANGER, TIER_FAMILIAR)
+# 自动升档：互动达到阈值后陌生人→熟人
+AUTO_BUMP_THRESHOLD = 6
 
 
 def _ensure_contact_columns(conn: sqlite3.Connection) -> None:
@@ -86,19 +77,14 @@ def normalize_tier(raw: str | None) -> str:
     s = (raw or "").strip()
     if s in VALID_TIERS:
         return s
-    aliases = {
-        "生人": TIER_STRANGER,
-        "stranger": TIER_STRANGER,
-        "认识": TIER_ACQUAINTANCE,
-        "acquaintance": TIER_ACQUAINTANCE,
-        "好友": TIER_FRIEND,
-        "friend": TIER_FRIEND,
-        "亲人": TIER_FAMILY,
-        "family": TIER_FAMILY,
-        "哥哥": TIER_FAMILY,
-        "家里人": TIER_FAMILY,
-    }
-    return aliases.get(s) or aliases.get(s.lower()) or TIER_STRANGER
+    # 旧等级兼容映射：朋友/家人 → 熟人
+    familiar_words = (
+        "熟人", "朋友", "家人", "好友", "亲人", "哥哥", "家里人",
+        "friend", "family", "acquaintance",
+    )
+    if s.lower() in familiar_words:
+        return TIER_FAMILIAR
+    return TIER_STRANGER
 
 def session_key_for(
     *,
@@ -208,13 +194,9 @@ def touch_contact(
             if bump_interact:
                 count += 1
             tier = normalize_tier(row["tier"])
-            # 自动升档：仅陌生人→熟人
-            if (
-                bump_interact
-                and count >= AUTO_BUMP_THRESHOLD
-                and TIER_RANK.get(tier, 0) < TIER_RANK[AUTO_TIER_CAP]
-            ):
-                tier = AUTO_TIER_CAP
+            # 自动升档：陌生人→熟人
+            if bump_interact and count >= AUTO_BUMP_THRESHOLD and tier == TIER_STRANGER:
+                tier = TIER_FAMILIAR
             sets = ["last_seen = ?", "updated_at = ?", "interact_count = ?", "tier = ?"]
             args: list[Any] = [now, now, count, tier]
             if nick:
@@ -399,12 +381,12 @@ def mark_private_seen(user_id: int | str) -> None:
 
 def list_private_care_candidates(
     *,
-    min_tier: str = TIER_FRIEND,
+    min_tier: str = TIER_FAMILIAR,
     idle_seconds: float,
     limit: int = 5,
 ) -> list[dict[str, Any]]:
     """久未私聊、且亲疏达标的联系人，供低频主动关心。"""
-    min_rank = TIER_RANK.get(normalize_tier(min_tier), 2)
+    need_familiar = normalize_tier(min_tier) == TIER_FAMILIAR
     cutoff = time.time() - max(0.0, idle_seconds)
     with _connect() as conn:
         rows = conn.execute(
@@ -418,7 +400,7 @@ def list_private_care_candidates(
     out: list[dict[str, Any]] = []
     for r in rows:
         tier = normalize_tier(r["tier"])
-        if TIER_RANK.get(tier, 0) < min_rank:
+        if need_familiar and tier != TIER_FAMILIAR:
             continue
         last_p = r["last_private_at"]
         # 从未私聊过：用 last_seen 判断是否「认识但久没聊」
@@ -432,22 +414,13 @@ def list_private_care_candidates(
 
 
 def relation_prompt_note(tier: str) -> str:
-    """按亲疏给模型一点语气差异提示。"""
-    t = normalize_tier(tier)
-    if t == TIER_FAMILY:
+    """按亲疏给模型语气提示（简化为两级）。"""
+    if normalize_tier(tier) == TIER_FAMILIAR:
         return (
-            "对方是家人级亲近的人：可以自然亲近一点、多接一句，"
-            "语气礼貌温和，不傲娇、不卖萌、不写括号动作。"
+            "对方是熟人：语气自然随意一点，可以接话、开玩笑，"
+            "不必过分客气，但仍遵守人设。"
         )
-    if t == TIER_FRIEND:
-        return (
-            "对方是朋友：比陌生人更愿意接话，礼貌友好，仍不抢戏、不显摆。"
-        )
-    if t == TIER_ACQUAINTANCE:
-        return "对方是熟人：正常简短回应即可，不必过分客气。"
-    return (
-        "对方暂是陌生人：客气、克制，不主动套近乎，不确定的事少接。"
-    )
+    return "对方是陌生人：客气、克制，不主动套近乎。"
 
 
 def list_contacts(*, limit: int = 50, only_aliased: bool = True) -> list[dict[str, Any]]:
